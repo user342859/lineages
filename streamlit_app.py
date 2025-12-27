@@ -1914,6 +1914,7 @@ with tab_schoolcomparison:
         idx=idx,
         lineage_func=lineage,
         rows_for_func=rows_for,
-        default_scores_folder="basic_scores",  # или другая папка
-        classifier_labels=classifier_labels,
+        scores_folder="basic_scores",        # ← Папка с профилями
+        specific_files=None,                  # ← None = все CSV, или ["file1.csv", "file2.csv"]
+        classifier_labels=classifier_labels,  # ← Опционально: названия узлов
     )
