@@ -36,7 +36,7 @@ from pyvis.network import Network
 from sklearn.metrics import silhouette_samples, silhouette_score
 
 from school_comparison_tab import render_school_comparison_tab
-from school_comparison_tab_opus45 import render_school_comparison_tab_opus45
+from school_comparison_opus45_tab import render_school_comparison_opus45_tab
 
 
 # ---------------------- Константы -----------------------------------------
@@ -1926,7 +1926,7 @@ with tab_schoolcomparison_opus45:
     # Словарь {код: название} из THEMATIC_CLASSIFIER
     classifier_labels = {code: title for code, title, _ in THEMATIC_CLASSIFIER}
     
-    render_school_comparison_tab_opus45(
+    render_school_comparison_opus45_tab(
         df=df,
         idx=idx,
         lineage_func=lineage,
