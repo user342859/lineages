@@ -38,12 +38,12 @@ class ThematicProfileManager:
         for f in all_files:
             try:
                 # Читаем CSV. Индекс - первая колонка (Code)
-                df = pd.read_csv(f, index_col=0)
+                csv_df = pd.read_csv(f, index_col=0)
                 # Приводим индекс к строке и убираем пробелы
-                df.index = df.index.astype(str).str.strip()
+                csv_df.index = csv_df.index.astype(str).str.strip()
                 # Убираем дубликаты индексов
-                df = df[~df.index.duplicated(keep='first')]
-                dfs.append(df)
+                csv_df = csv_df[~csv_df.index.duplicated(keep='first')]
+                dfs.append(csv_df)
             except Exception as e:
                 st.warning(f"Не удалось прочитать файл {os.path.basename(f)}: {e}")
         
@@ -57,8 +57,9 @@ class ThematicProfileManager:
         full_df = full_df[sorted_cols]
         
         self.columns = sorted_cols
-        # Сохраняем map: ID -> Vector
-        self.profiles = {k: v for k, v in zip(full_df.index, full_df.values)}
+        # Сохраняем map: ID -> Vector (явно как numpy array)
+        for idx_val in full_df.index:
+            self.profiles[idx_val] = full_df.loc[idx_val].values.astype(float)
         
         return len(dfs), len(self.profiles)
 
@@ -111,7 +112,7 @@ def calculate_distance_matrix(X: np.ndarray, G: np.ndarray, metric_mode: str) ->
     diag_K = np.diag(K)
     
     if "косинус" in metric_mode.lower():
-        norms = np.sqrt(diag_K)
+        norms = np.sqrt(np.maximum(diag_K, 0))  # защита от отрицательных значений
         norms_outer = np.outer(norms, norms)
         norms_outer[norms_outer == 0] = 1.0
         sim = K / norms_outer
@@ -159,7 +160,7 @@ def render_school_comparison_tab(df: pd.DataFrame,
             )
             
             manager = ThematicProfileManager(scores_folder)
-            has_files, _ = manager.load_data(selected_files if selected_files else None)
+            has_files, num_profiles = manager.load_data(selected_files if selected_files else None)
             
             available_nodes = ["Весь базис"]
             if has_files:
@@ -177,14 +178,14 @@ def render_school_comparison_tab(df: pd.DataFrame,
     # --- 2. Выбор школ ---
     st.subheader("Выбор научных школ")
     
-    # Собираем список всех имен (авторов и руководителей)
+    # Определяем колонку автора
     author_col = "candidate_name"
-    # Пытаемся найти колонку автора, если она называется иначе
     if author_col not in df.columns:
         possible_auth_cols = [c for c in df.columns if "name" in c.lower() or "author" in c.lower()]
         if possible_auth_cols:
             author_col = possible_auth_cols[0]
             
+    # Собираем все имена (авторы + руководители)
     all_names_set = set()
     if author_col in df.columns:
         all_names_set.update(df[author_col].dropna().unique())
@@ -201,45 +202,41 @@ def render_school_comparison_tab(df: pd.DataFrame,
     )
 
     if not selected_roots or not has_files:
-        if not has_files: st.error("Файлы профилей не найдены.")
+        if not has_files: 
+            st.error("Файлы профилей не найдены.")
         return
 
     if st.button("🚀 Рассчитать сравнение"):
         
         # --- 3. ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК СВЯЗУЮЩЕЙ КОЛОНКИ (ID) ---
         
-        # Получаем все ID профилей, которые у нас есть (ключи из CSV)
+        # Получаем все ID профилей
         available_profile_ids = set(manager.profiles.keys())
         
         best_col = None
         max_overlap = 0
         
-        # Перебираем все колонки в основном датафрейме
+        # Перебираем все колонки
         for col in df.columns:
-            # Превращаем значения колонки в строки и очищаем
-            col_values = set(df[col].dropna().astype(str).str.strip())
-            
-            # Считаем пересечение с ID профилей
-            overlap = len(col_values.intersection(available_profile_ids))
-            
-            if overlap > max_overlap:
-                max_overlap = overlap
-                best_col = col
+            try:
+                col_values = set(df[col].dropna().astype(str).str.strip())
+                overlap = len(col_values.intersection(available_profile_ids))
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    best_col = col
+            except Exception:
+                continue
 
-        # Проверяем результат
         if best_col and max_overlap > 0:
             id_col = best_col
-            # st.success(f"🔗 Связь установлена по колонке: **{id_col}** ({max_overlap} совпадений)")
         else:
-            st.error("❌ Не удалось найти колонку в данных, совпадающую с ID профилей (Code). Проверьте форматы данных.")
-            # Для отладки выведем список колонок
-            with st.expander("Отладка: список колонок в данных"):
-                st.write(df.columns.tolist())
-                st.write(f"Пример ID из профилей: {list(available_profile_ids)[:3]}")
+            st.error("❌ Не удалось найти колонку, совпадающую с ID профилей.")
+            with st.expander("Отладка"):
+                st.write("Колонки в данных:", df.columns.tolist())
+                st.write("Пример ID из профилей:", list(available_profile_ids)[:5])
             return
 
-        # Создаем словарь Имя -> ID
-        # Берем только те строки, где есть и имя, и ID
+        # Словарь Имя -> ID
         df_clean = df[[author_col, id_col]].dropna()
         name_to_id_map = dict(zip(df_clean[author_col], df_clean[id_col].astype(str).str.strip()))
         
@@ -258,10 +255,8 @@ def render_school_comparison_tab(df: pd.DataFrame,
 
         with st.spinner("Поиск профилей и расчет метрик..."):
             for root_name in selected_roots:
-                # 1. Получаем дерево потомков
                 G, _ = lineage_func(df, idx, root_name, None)
                 
-                # 2. Определяем список участников
                 members = []
                 if "Непосредственное" in comparison_mode:
                     if root_name in G:
@@ -274,22 +269,27 @@ def render_school_comparison_tab(df: pd.DataFrame,
                 found_count = 0
                 
                 for member_name in members:
-                    # Пытаемся найти ID
                     person_id = name_to_id_map.get(member_name)
                     
                     if not person_id:
                         continue
                         
-                    # Ищем вектор
                     vec = manager.profiles.get(person_id)
                     
                     if vec is not None:
-                        vec_basis = vec[basis_indices]
-                        if np.sum(np.abs(vec_basis)) > 0:
-                            X_vectors.append(vec_basis)
-                            Y_labels.append(root_name)
-                            Point_labels.append(member_name)
-                            found_count += 1
+                        try:
+                            # Явно приводим к numpy array float
+                            vec_arr = np.asarray(vec, dtype=float)
+                            vec_basis = vec_arr[basis_indices]
+                            
+                            # Проверяем, что вектор не нулевой
+                            if np.nansum(np.abs(vec_basis)) > 0:
+                                X_vectors.append(vec_basis.copy())
+                                Y_labels.append(root_name)
+                                Point_labels.append(member_name)
+                                found_count += 1
+                        except Exception:
+                            continue
                             
                 schools_stats[root_name] = {"total": len(members), "found": found_count}
 
@@ -299,11 +299,11 @@ def render_school_comparison_tab(df: pd.DataFrame,
             cols[i % len(cols)].metric(school, f"{stats['found']} / {stats['total']}")
 
         if len(X_vectors) < 2:
-            st.warning("Недостаточно найденных профилей (нужно минимум 2) для построения графика.")
+            st.warning("Недостаточно найденных профилей (нужно минимум 2).")
             return
 
         # --- 5. Расчет ---
-        X = np.array(X_vectors)
+        X = np.array(X_vectors, dtype=float)
         G_matrix = manager.build_gram_matrix(basis_cols_names, metric_mode)
         dist_matrix = calculate_distance_matrix(X, G_matrix, metric_mode)
         
@@ -313,7 +313,7 @@ def render_school_comparison_tab(df: pd.DataFrame,
                 sil_avg = silhouette_score(dist_matrix, Y_labels, metric="precomputed")
                 sample_vals = silhouette_samples(dist_matrix, Y_labels, metric="precomputed")
                 
-                st.metric("Silhouette Score (Средний силуэт)", f"{sil_avg:.3f}")
+                st.metric("Silhouette Score", f"{sil_avg:.3f}")
                 
                 fig = go.Figure()
                 unique_labels = sorted(list(set(Y_labels)))
@@ -325,7 +325,6 @@ def render_school_comparison_tab(df: pd.DataFrame,
                     vals = sample_vals[indices]
                     names = [Point_labels[j] for j in indices]
                     
-                    # Сортировка внутри кластера
                     zipped = sorted(zip(vals, names), key=lambda x: x[0])
                     s_vals = [z[0] for z in zipped]
                     s_names = [z[1] for z in zipped]
@@ -355,4 +354,4 @@ def render_school_comparison_tab(df: pd.DataFrame,
             except Exception as e:
                 st.error(f"Ошибка расчета силуэта: {e}")
         else:
-            st.info("⚠️ Выбрана одна школа. Показан внутренний разброс, но метрика Силуэта требует наличия хотя бы двух групп для сравнения.")
+            st.info("⚠️ Для расчета силуэта нужно минимум 2 школы.")
