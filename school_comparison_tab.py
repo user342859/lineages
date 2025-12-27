@@ -37,13 +37,13 @@ class ThematicProfileManager:
         dfs = []
         for f in all_files:
             try:
-                # Читаем CSV. Индекс - первая колонка (Code)
-                csv_df = pd.read_csv(f, index_col=0)
-                # Приводим индекс к строке и убираем пробелы
-                csv_df.index = csv_df.index.astype(str).str.strip()
-                # Убираем дубликаты индексов
-                csv_df = csv_df[~csv_df.index.duplicated(keep='first')]
-                dfs.append(csv_df)
+                # Читаем CSV. Предполагаем, что ID находится в первой колонке (index_col=0)
+                df = pd.read_csv(f, index_col=0)
+                # Индекс приводим к строке
+                df.index = df.index.astype(str)
+                # Убираем дубликаты
+                df = df[~df.index.duplicated(keep='first')]
+                dfs.append(df)
             except Exception as e:
                 st.warning(f"Не удалось прочитать файл {os.path.basename(f)}: {e}")
         
@@ -57,9 +57,8 @@ class ThematicProfileManager:
         full_df = full_df[sorted_cols]
         
         self.columns = sorted_cols
-        # Сохраняем map: ID -> Vector (явно как numpy array)
-        for idx_val in full_df.index:
-            self.profiles[idx_val] = full_df.loc[idx_val].values.astype(float)
+        # Сохраняем map: ID -> Vector
+        self.profiles = {k: v for k, v in zip(full_df.index, full_df.values)}
         
         return len(dfs), len(self.profiles)
 
@@ -112,7 +111,7 @@ def calculate_distance_matrix(X: np.ndarray, G: np.ndarray, metric_mode: str) ->
     diag_K = np.diag(K)
     
     if "косинус" in metric_mode.lower():
-        norms = np.sqrt(np.maximum(diag_K, 0))  # защита от отрицательных значений
+        norms = np.sqrt(diag_K)
         norms_outer = np.outer(norms, norms)
         norms_outer[norms_outer == 0] = 1.0
         sim = K / norms_outer
@@ -160,7 +159,7 @@ def render_school_comparison_tab(df: pd.DataFrame,
             )
             
             manager = ThematicProfileManager(scores_folder)
-            has_files, num_profiles = manager.load_data(selected_files if selected_files else None)
+            has_files, _ = manager.load_data(selected_files if selected_files else None)
             
             available_nodes = ["Весь базис"]
             if has_files:
@@ -175,70 +174,67 @@ def render_school_comparison_tab(df: pd.DataFrame,
             else:
                 basis_selection = "Весь базис"
 
-    # --- 2. Выбор школ ---
+    # --- 2. Выбор школ (FIX: Собираем имена из всех колонок) ---
     st.subheader("Выбор научных школ")
     
-    # Определяем колонку автора
+    # Определяем основные колонки
     author_col = "candidate_name"
     if author_col not in df.columns:
-        possible_auth_cols = [c for c in df.columns if "name" in c.lower() or "author" in c.lower()]
-        if possible_auth_cols:
-            author_col = possible_auth_cols[0]
-            
-    # Собираем все имена (авторы + руководители)
+        # Fallback
+        str_cols = df.select_dtypes(include=['object']).columns
+        if len(str_cols) > 0:
+            author_col = str_cols[0]
+    
+    # Собираем ВСЕ имена (кандидаты + руководители)
     all_names_set = set()
+    
+    # Добавляем авторов
     if author_col in df.columns:
         all_names_set.update(df[author_col].dropna().unique())
+        
+    # Добавляем руководителей (ищем колонки, содержащие 'supervisor' и 'name')
     for col in df.columns:
         if 'supervisor' in col.lower() and 'name' in col.lower():
             all_names_set.update(df[col].dropna().unique())
             
+    # Превращаем в сортированный список
     all_candidates_list = sorted([str(x).strip() for x in all_names_set if str(x).strip()])
     
     selected_roots = st.multiselect(
         "Выберите основателей научных школ:", 
         all_candidates_list,
-        placeholder="Начните вводить фамилию..."
+        placeholder="Начните вводить фамилию (например, Кузнецов)..."
     )
 
     if not selected_roots or not has_files:
-        if not has_files: 
-            st.error("Файлы профилей не найдены.")
+        if not has_files: st.error("Файлы профилей не найдены.")
         return
 
     if st.button("🚀 Рассчитать сравнение"):
         
-        # --- 3. ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК СВЯЗУЮЩЕЙ КОЛОНКИ (ID) ---
+        # --- 3. Определение ID колонки ---
+        possible_id_cols = ['id', 'code', 'rosrid_id', 'author_id', 'dis_id']
+        id_col = None
+        for col in possible_id_cols:
+            if col in df.columns:
+                id_col = col
+                break
+        if id_col is None:
+            # Пытаемся найти любую колонку с 'id'
+            for col in df.columns:
+                if 'id' in col.lower():
+                    id_col = col
+                    break
         
-        # Получаем все ID профилей
-        available_profile_ids = set(manager.profiles.keys())
-        
-        best_col = None
-        max_overlap = 0
-        
-        # Перебираем все колонки
-        for col in df.columns:
-            try:
-                col_values = set(df[col].dropna().astype(str).str.strip())
-                overlap = len(col_values.intersection(available_profile_ids))
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_col = col
-            except Exception:
-                continue
-
-        if best_col and max_overlap > 0:
-            id_col = best_col
-        else:
-            st.error("❌ Не удалось найти колонку, совпадающую с ID профилей.")
-            with st.expander("Отладка"):
-                st.write("Колонки в данных:", df.columns.tolist())
-                st.write("Пример ID из профилей:", list(available_profile_ids)[:5])
+        if id_col is None:
+            st.error("В данных не найдена колонка ID. Невозможно сопоставить имена с профилями.")
             return
 
-        # Словарь Имя -> ID
+        # Словарь Имя -> ID. 
+        # ВАЖНО: Мы можем получить ID только тех, у кого есть своя строка (защита) в DF.
+        # Если человек только руководитель, у него может не быть ID диссертации в этой базе.
         df_clean = df[[author_col, id_col]].dropna()
-        name_to_id_map = dict(zip(df_clean[author_col], df_clean[id_col].astype(str).str.strip()))
+        name_to_id_map = dict(zip(df_clean[author_col], df_clean[id_col].astype(str)))
         
         # --- 4. Сбор векторов ---
         X_vectors = []
@@ -253,10 +249,12 @@ def render_school_comparison_tab(df: pd.DataFrame,
             st.error("Пустой базис.")
             return
 
-        with st.spinner("Поиск профилей и расчет метрик..."):
+        with st.spinner("Анализ..."):
             for root_name in selected_roots:
+                # 1. Получаем дерево потомков
                 G, _ = lineage_func(df, idx, root_name, None)
                 
+                # 2. Определяем список участников
                 members = []
                 if "Непосредственное" in comparison_mode:
                     if root_name in G:
@@ -269,27 +267,24 @@ def render_school_comparison_tab(df: pd.DataFrame,
                 found_count = 0
                 
                 for member_name in members:
+                    # Пытаемся найти ID
                     person_id = name_to_id_map.get(member_name)
                     
+                    # Если ID нет (например, человек только научрук без своей диссертации в базе),
+                    # мы пропускаем его, так как не можем найти его вектор.
                     if not person_id:
                         continue
                         
+                    # Ищем вектор
                     vec = manager.profiles.get(person_id)
                     
                     if vec is not None:
-                        try:
-                            # Явно приводим к numpy array float
-                            vec_arr = np.asarray(vec, dtype=float)
-                            vec_basis = vec_arr[basis_indices]
-                            
-                            # Проверяем, что вектор не нулевой
-                            if np.nansum(np.abs(vec_basis)) > 0:
-                                X_vectors.append(vec_basis.copy())
-                                Y_labels.append(root_name)
-                                Point_labels.append(member_name)
-                                found_count += 1
-                        except Exception:
-                            continue
+                        vec_basis = vec[basis_indices]
+                        if np.sum(np.abs(vec_basis)) > 0:
+                            X_vectors.append(vec_basis)
+                            Y_labels.append(root_name)
+                            Point_labels.append(member_name)
+                            found_count += 1
                             
                 schools_stats[root_name] = {"total": len(members), "found": found_count}
 
@@ -299,11 +294,11 @@ def render_school_comparison_tab(df: pd.DataFrame,
             cols[i % len(cols)].metric(school, f"{stats['found']} / {stats['total']}")
 
         if len(X_vectors) < 2:
-            st.warning("Недостаточно найденных профилей (нужно минимум 2).")
+            st.warning("Недостаточно векторов для анализа (нужно минимум 2 найденных профиля).")
             return
 
         # --- 5. Расчет ---
-        X = np.array(X_vectors, dtype=float)
+        X = np.array(X_vectors)
         G_matrix = manager.build_gram_matrix(basis_cols_names, metric_mode)
         dist_matrix = calculate_distance_matrix(X, G_matrix, metric_mode)
         
@@ -348,10 +343,9 @@ def render_school_comparison_tab(df: pd.DataFrame,
                     height=max(500, y_pos * 15),
                     legend_title="Научные школы"
                 )
-                
                 st.plotly_chart(fig, use_container_width=True)
-                
             except Exception as e:
                 st.error(f"Ошибка расчета силуэта: {e}")
         else:
-            st.info("⚠️ Для расчета силуэта нужно минимум 2 школы.")
+            st.info("⚠️ Выбрана одна школа. Показан внутренний разброс, но общий Silhouette Score не применим.")
+            # Можно показать просто scatter plot или PCA, но по ТЗ нужен силуэт.
