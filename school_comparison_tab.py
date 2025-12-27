@@ -38,11 +38,10 @@ class ThematicProfileManager:
         for f in all_files:
             try:
                 # Читаем CSV. Предполагаем, что ID находится в первой колонке (index_col=0)
-                # Пример: Code, 1.1, 1.1.1 ...
                 df = pd.read_csv(f, index_col=0)
-                # Индекс приводим к строке, чтобы точно совпадал с ID из базы
+                # Индекс приводим к строке
                 df.index = df.index.astype(str)
-                # Убираем дубликаты индексов
+                # Убираем дубликаты
                 df = df[~df.index.duplicated(keep='first')]
                 dfs.append(df)
             except Exception as e:
@@ -78,7 +77,6 @@ class ThematicProfileManager:
         if "прямоугольн" in metric_mode.lower():
             return np.eye(dim)
         
-        # Матрица для косоугольного базиса
         G = np.eye(dim)
         col_parts = [c.split('.') for c in basis_cols]
         
@@ -108,7 +106,6 @@ def calculate_distance_matrix(X: np.ndarray, G: np.ndarray, metric_mode: str) ->
         elif "косинус" in metric_mode.lower():
             return cosine_distances(X, X)
     
-    # Расчет в метрике G
     X_G = X @ G
     K = X_G @ X.T
     diag_K = np.diag(K)
@@ -177,19 +174,37 @@ def render_school_comparison_tab(df: pd.DataFrame,
             else:
                 basis_selection = "Весь базис"
 
-    # --- 2. Выбор школ ---
+    # --- 2. Выбор школ (FIX: Собираем имена из всех колонок) ---
     st.subheader("Выбор научных школ")
     
-    # Определяем колонку с ФИО
+    # Определяем основные колонки
     author_col = "candidate_name"
     if author_col not in df.columns:
-        # Пытаемся угадать, если вдруг название другое
+        # Fallback
         str_cols = df.select_dtypes(include=['object']).columns
         if len(str_cols) > 0:
             author_col = str_cols[0]
+    
+    # Собираем ВСЕ имена (кандидаты + руководители)
+    all_names_set = set()
+    
+    # Добавляем авторов
+    if author_col in df.columns:
+        all_names_set.update(df[author_col].dropna().unique())
+        
+    # Добавляем руководителей (ищем колонки, содержащие 'supervisor' и 'name')
+    for col in df.columns:
+        if 'supervisor' in col.lower() and 'name' in col.lower():
+            all_names_set.update(df[col].dropna().unique())
             
-    all_candidates = sorted(df[author_col].dropna().unique())
-    selected_roots = st.multiselect("Основатели школ:", all_candidates)
+    # Превращаем в сортированный список
+    all_candidates_list = sorted([str(x).strip() for x in all_names_set if str(x).strip()])
+    
+    selected_roots = st.multiselect(
+        "Выберите основателей научных школ:", 
+        all_candidates_list,
+        placeholder="Начните вводить фамилию (например, Кузнецов)..."
+    )
 
     if not selected_roots or not has_files:
         if not has_files: st.error("Файлы профилей не найдены.")
@@ -197,37 +212,29 @@ def render_school_comparison_tab(df: pd.DataFrame,
 
     if st.button("🚀 Рассчитать сравнение"):
         
-        # --- 3. ОПРЕДЕЛЕНИЕ ID КОЛОНКИ (FIX) ---
-        # Нам нужно найти колонку в df, которая соответствует ID в basic_scores (Code)
-        
-        # Возможные названия колонки ID в df
+        # --- 3. Определение ID колонки ---
         possible_id_cols = ['id', 'code', 'rosrid_id', 'author_id', 'dis_id']
         id_col = None
-        
-        # Ищем точное совпадение
         for col in possible_id_cols:
             if col in df.columns:
                 id_col = col
                 break
-        
-        # Если не нашли, ищем колонку, содержащую 'id' (case insensitive)
         if id_col is None:
+            # Пытаемся найти любую колонку с 'id'
             for col in df.columns:
                 if 'id' in col.lower():
                     id_col = col
                     break
         
         if id_col is None:
-            st.error("Не удалось найти колонку с ID (id, code, etc.) в основном файле данных. Невозможно связать персону с вектором.")
+            st.error("В данных не найдена колонка ID. Невозможно сопоставить имена с профилями.")
             return
 
-        # Создаем быстрый lookup словарь: Имя -> ID
-        # Если имен много одинаковых, берем первый попавшийся ID (или обрабатываем список)
-        # df[author_col] -> df[id_col]
-        
-        # Приводим ID к строке для матчинга с keys словаря profiles
-        name_to_id_map = dict(zip(df[author_col], df[id_col].astype(str)))
-        
+        # Словарь Имя -> ID. 
+        # ВАЖНО: Мы можем получить ID только тех, у кого есть своя строка (защита) в DF.
+        # Если человек только руководитель, у него может не быть ID диссертации в этой базе.
+        df_clean = df[[author_col, id_col]].dropna()
+        name_to_id_map = dict(zip(df_clean[author_col], df_clean[id_col].astype(str)))
         
         # --- 4. Сбор векторов ---
         X_vectors = []
@@ -242,11 +249,12 @@ def render_school_comparison_tab(df: pd.DataFrame,
             st.error("Пустой базис.")
             return
 
-        with st.spinner("Анализ структур школ и поиск векторов..."):
+        with st.spinner("Анализ..."):
             for root_name in selected_roots:
-                # Строим дерево
+                # 1. Получаем дерево потомков
                 G, _ = lineage_func(df, idx, root_name, None)
                 
+                # 2. Определяем список участников
                 members = []
                 if "Непосредственное" in comparison_mode:
                     if root_name in G:
@@ -259,20 +267,19 @@ def render_school_comparison_tab(df: pd.DataFrame,
                 found_count = 0
                 
                 for member_name in members:
-                    # 1. Получаем ID персоны из main DF
+                    # Пытаемся найти ID
                     person_id = name_to_id_map.get(member_name)
                     
+                    # Если ID нет (например, человек только научрук без своей диссертации в базе),
+                    # мы пропускаем его, так как не можем найти его вектор.
                     if not person_id:
                         continue
                         
-                    # 2. Ищем вектор по ID
+                    # Ищем вектор
                     vec = manager.profiles.get(person_id)
                     
                     if vec is not None:
-                        # Фильтрация по базису
                         vec_basis = vec[basis_indices]
-                        
-                        # Пропускаем нулевые вектора (нет данных по этому разделу)
                         if np.sum(np.abs(vec_basis)) > 0:
                             X_vectors.append(vec_basis)
                             Y_labels.append(root_name)
@@ -281,21 +288,21 @@ def render_school_comparison_tab(df: pd.DataFrame,
                             
                 schools_stats[root_name] = {"total": len(members), "found": found_count}
 
-        # Вывод статистики
+        # Статистика
         cols = st.columns(len(selected_roots))
         for i, (school, stats) in enumerate(schools_stats.items()):
             cols[i % len(cols)].metric(school, f"{stats['found']} / {stats['total']}")
 
         if len(X_vectors) < 2:
-            st.warning("Недостаточно векторов для анализа.")
+            st.warning("Недостаточно векторов для анализа (нужно минимум 2 найденных профиля).")
             return
 
-        # --- 5. Расчет и Визуализация ---
+        # --- 5. Расчет ---
         X = np.array(X_vectors)
         G_matrix = manager.build_gram_matrix(basis_cols_names, metric_mode)
         dist_matrix = calculate_distance_matrix(X, G_matrix, metric_mode)
         
-        # Силуэт
+        # --- 6. Визуализация ---
         if len(set(Y_labels)) > 1:
             try:
                 sil_avg = silhouette_score(dist_matrix, Y_labels, metric="precomputed")
@@ -313,7 +320,6 @@ def render_school_comparison_tab(df: pd.DataFrame,
                     vals = sample_vals[indices]
                     names = [Point_labels[j] for j in indices]
                     
-                    # Сортировка
                     zipped = sorted(zip(vals, names), key=lambda x: x[0])
                     s_vals = [z[0] for z in zipped]
                     s_names = [z[1] for z in zipped]
@@ -325,18 +331,21 @@ def render_school_comparison_tab(df: pd.DataFrame,
                         orientation='h',
                         marker_color=colors[i % len(colors)],
                         text=s_names,
+                        hoverinfo='x+text+name',
                         width=1.0
                     ))
                     y_pos += len(s_vals) + 5
                     
                 fig.update_layout(
-                    title="График силуэта", 
+                    title="График силуэта (Тематические профили)", 
                     bargap=0, 
                     yaxis=dict(showticklabels=False),
-                    height=600
+                    height=max(500, y_pos * 15),
+                    legend_title="Научные школы"
                 )
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
                 st.error(f"Ошибка расчета силуэта: {e}")
         else:
-            st.info("Для расчета силуэта нужно минимум 2 школы.")
+            st.info("⚠️ Выбрана одна школа. Показан внутренний разброс, но общий Silhouette Score не применим.")
+            # Можно показать просто scatter plot или PCA, но по ТЗ нужен силуэт.
